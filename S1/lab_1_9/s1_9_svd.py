@@ -75,5 +75,86 @@ print(f"top 5 directions hold {cum[4]*100:.1f}% of the energy")
 assert sm[0] >= sm[-1]                          # always sorted big -> small
 assert cum[4] > 0.99                            # this matrix is really rank ~5: tail is ~nothing
 
+
+# === SECTION 6 - INSIDE AI #1: RECOMMENDERS (20 ratings are really 2 hidden tastes) ===
+# 🎭 Analogy: nobody labelled "action" and "romance" - the factorization discovers them.
+# A ratings table with structure is LOW RANK: SVD finds the few hidden factors behind it.
+users = ["Ana", "Ben", "Cara", "Dev"]
+taste = np.array([[1.0, 0.2],      # how much each viewer likes [action, romance]
+                  [0.9, 0.3],
+                  [0.2, 1.0],
+                  [0.3, 0.9]])
+film = np.array([[5.0, 4.6, 1.2, 1.0, 4.8],    # how much each film HAS of [action, romance]
+                 [1.0, 1.4, 4.9, 4.7, 1.2]])
+R = taste @ film                                # the full 4x5 ratings table
+print("ratings table:\n", np.round(R, 1))
+sr = np.linalg.svd(R, compute_uv=False)
+print("singular values:", np.round(sr, 2))      # -> [16.04, 5.64, 0, 0]: only TWO matter
+assert np.linalg.matrix_rank(R) == 2            # 20 numbers, 2 real degrees of freedom
+# reconstruct from the top 2 singular directions alone -> exact
+Ur, sr2, Vtr = np.linalg.svd(R)
+R2 = Ur[:, :2] @ np.diag(sr2[:2]) @ Vtr[:2, :]
+assert np.allclose(R2, R)                       # rank-2 rebuild is perfect
+print("rank-2 reconstruction is exact:", np.allclose(R2, R))
+# NOTE (honest caveat): real recommenders can't run plain SVD - the table has MISSING entries.
+# The Netflix-prize systems used the same factorization IDEA fit by gradient descent on the
+# observed cells only ("FunkSVD"), then predicted the gaps from the learned factors.
+
+
+# === SECTION 7 - INSIDE AI #2: MEANING FROM TEXT (truncated SVD = LSA) ===
+# Keep the top-k singular directions of a word x document count matrix and synonyms collapse
+# together — the direct ancestor of modern word embeddings.
+vocab = ["car", "automobile", "banana", "mango"]
+#            doc1 doc2 doc3 doc4  (docs 1-2 are about vehicles, 3-4 about fruit)
+counts = np.array([[4, 6, 0, 1],     # car          (real counts are lopsided, not symmetric)
+                   [5, 3, 1, 0],     # automobile
+                   [0, 1, 5, 4],     # banana
+                   [1, 0, 3, 6]], float)
+Uw, sw, Vtw = np.linalg.svd(counts)
+emb = Uw[:, :2] * sw[:2]             # each word's coordinates in the top-2 "concept" space
+
+
+def cos(a, b):
+    return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+
+sim_syn = cos(emb[0], emb[1])        # car vs automobile
+sim_unrel = cos(emb[0], emb[2])      # car vs banana
+print(f"cos(car, automobile) = {sim_syn:+.6f}")   # ~0.99999: they land almost exactly together
+print(f"cos(car, banana)     = {sim_unrel:+.6f}")
+assert sim_syn > 0.9                 # synonyms land almost on top of each other
+assert sim_syn > sim_unrel           # and far from the unrelated word
+print("truncated SVD learned that car ~ automobile, with no dictionary")
+
+
+# === SECTION 8 - INSIDE AI #3: THE SPECTRAL NORM DECIDES IF TRAINING SURVIVES ===
+# sigma_1 is the MOST a layer can amplify any input (the spectral norm / Lipschitz bound).
+# Stack layers and it compounds: >1 explodes, <1 vanishes. Spectral normalization divides
+# W by sigma_1 to force it to exactly 1 — and finds sigma_1 by POWER ITERATION (episode 1.8).
+rng = np.random.default_rng(0)
+W = rng.standard_normal((64, 64))
+sigma1 = np.linalg.svd(W, compute_uv=False)[0]
+# sigma_1 really is the worst-case amplification over all inputs:
+worst = max(np.linalg.norm(W @ (v := rng.standard_normal(64)) ) / np.linalg.norm(v)
+            for _ in range(2000))
+print(f"sigma_1 = {sigma1:.3f},  worst amplification sampled = {worst:.3f}")
+assert worst <= sigma1 + 1e-9        # nothing can be amplified more than sigma_1
+
+for s in (1.4, 0.7):                 # what compounding does over depth
+    print(f"  sigma_1={s}: after 3 layers x{s**3:.2f},  after 100 layers x{s**100:.2e}")
+
+# power iteration finds sigma_1 without a full SVD (what spectral norm does every step)
+v = rng.standard_normal(64)
+for _ in range(100):
+    v = W.T @ (W @ v)
+    v /= np.linalg.norm(v)
+sigma1_power = np.linalg.norm(W @ v)
+print(f"power iteration sigma_1 = {sigma1_power:.3f}  (exact {sigma1:.3f})")
+assert np.isclose(sigma1_power, sigma1, rtol=1e-4)
+W_sn = W / sigma1                     # spectral normalization
+assert np.isclose(np.linalg.svd(W_sn, compute_uv=False)[0], 1.0)
+print("after spectral normalization, sigma_1 = 1.0 exactly")
+
 print("\nLAB COMPLETE - A = U S V^T for any matrix (even non-square), U and V orthonormal,")
-print("the unit circle maps to an ellipse with sigma-length axes, and the sigmas rank directions.")
+print("the unit circle maps to an ellipse with sigma-length axes, the sigmas rank directions,")
+print("and SVD is running inside recommenders, word embeddings, and training stability.")

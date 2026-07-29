@@ -143,6 +143,76 @@ assert A.shape == (len(SENT) + 1, len(SENT) + 1)
 assert np.allclose(A.sum(axis=1), 1.0)             # EVERY row is a probability distribution
 print("row for 'it':", " ".join(f"{t}={v:.2f}" for t, v in zip(SENT + ["tired"], A[IT]) if v > 0.03))
 
+
+# === SECTION 7 - THE SAME FORMULA ON OTHER SENTENCES (nothing new, just reuse) ===
+# 🎭 Analogy: one tool, many jobs. Change the sentence, change nothing else, and the same
+# equation resolves a different pronoun. NOTE the design: NOUN axes say what a thing IS, QUERY
+# axes are what an adjective ASKS FOR, and W_K maps noun-property -> query-axis (CROSS-axis).
+# That matters: with an identity mapping the adjective advertises its own property, so "sweet"
+# scores as high as "flower" and the demo points at the wrong word.
+NOUN = ["animate", "road", "size", "plant", "container", "massive", "fn"]
+QRY = ["q_tired", "q_wide", "q_sweet", "q_hollow", "q_heavy"]
+AX = NOUN + QRY
+N2 = len(AX)
+
+
+def vec(**kw):
+    a = [0.0] * N2
+    for k, val in kw.items():
+        a[AX.index(k)] = val
+    for i, nm in enumerate(AX):                      # dense, like real embeddings
+        if a[i] == 0 and nm in ("animate", "road", "size", "plant", "container", "massive"):
+            a[i] = .05
+    return a
+
+
+E2 = {"the": vec(fn=1), "i": vec(animate=1, fn=.2), "on": vec(fn=1), "was": vec(fn=1),
+      "too": vec(fn=1), "because": vec(fn=1), "didn't": vec(fn=1),
+      "animal": vec(animate=1, size=.5), "street": vec(road=1, size=.6),
+      "cross": vec(animate=.1, road=.4, fn=.3),
+      "bee": vec(animate=1, size=.1), "flower": vec(plant=1, size=.2),
+      "landed": vec(animate=.1, fn=.3),
+      "book": vec(massive=1, size=.3), "shelf": vec(container=1, size=.5),
+      "put": vec(animate=.1, fn=.3),
+      "it": vec(animate=.3, road=.3, fn=.4),
+      "tired": vec(q_tired=1), "wide": vec(q_wide=1), "sweet": vec(q_sweet=1),
+      "empty": vec(q_hollow=1), "heavy": vec(q_heavy=1)}
+WK2 = np.zeros((N2, N2))
+for src, dst in [("animate", "q_tired"), ("road", "q_wide"), ("plant", "q_sweet"),
+                 ("container", "q_hollow"), ("massive", "q_heavy")]:
+    WK2[AX.index(src), AX.index(dst)] = 1.0
+WK2[AX.index("size"), AX.index("q_wide")] = 0.3
+WQ2 = np.zeros((N2, N2))
+for qa in QRY:
+    WQ2[AX.index(qa), AX.index(qa)] = 1.0
+
+
+def attend(sentence, adjective, pronoun="it"):
+    toks = sentence.split() + [adjective]
+    X = np.array([E2[t] for t in toks], float)
+    i = toks.index(pronoun)
+    q = (X[i] + X[-1]) @ WQ2                          # the earlier layer's mixing step again
+    sc = (X @ WK2) @ q * GAIN
+    sc[i] = -1e9
+    w = np.exp(sc - sc.max()); w /= w.sum()
+    return toks, w
+
+
+CASES = [("the animal didn't cross the street because it was too", "tired", "animal"),
+         ("the animal didn't cross the street because it was too", "wide", "street"),
+         ("the bee landed on the flower because it was", "sweet", "flower"),
+         ("the bee landed on the flower because it was", "tired", "bee"),
+         ("i put the book on the shelf because it was", "empty", "shelf"),
+         ("i put the book on the shelf because it was", "heavy", "book")]
+print("\nsame formula, six sentences:")
+for sent, adj, expected in CASES:
+    toks, w = attend(sent, adj)
+    j = int(np.argmax(w))
+    print(f"  ...too {adj:6} -> {toks[j]:7} ({w[j]:.3f})")
+    assert toks[j] == expected, f"{adj} should resolve to {expected}"
+    # and only ONE candidate should be strong enough to draw (no ambiguous second arrow)
+    assert sum(1 for x in w if x >= 0.15) == 1
+
 print("\nLAB COMPLETE — attention is a weighted average of values, and the weights are dot products.")
 print("NEXT (part 2): run this at real size and the softmax collapses to a single spike.")
 print("The fix is one division — / sqrt(d_k) — and then we run eight of these at once.")

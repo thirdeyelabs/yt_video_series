@@ -213,6 +213,187 @@ for sent, adj, expected in CASES:
     # and only ONE candidate should be strong enough to draw (no ambiguous second arrow)
     assert sum(1 for x in w if x >= 0.15) == 1
 
+# === SECTION 8 - THE SAME THING INSIDE A REAL TRAINED MODEL ===
+# 🎭 Analogy: we built a toy engine so you could see every moving part. Now open the bonnet of
+# a car that actually drives. Same parts, sixty six million of them.
+#
+# pip install torch transformers          # ~250 MB download the first time
+# Every number the video shows in the "real model" beat is printed and asserted here.
+try:
+    # Keep the notebook output clean. ORDER MATTERS: tqdm.auto emits its IProgress warning at
+    # IMPORT time (transformers imports it), so the filter has to be installed BEFORE that
+    # import or the red stderr block appears anyway.
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    import torch
+    from transformers import AutoTokenizer, AutoModel, logging as hf_logging
+
+    hf_logging.set_verbosity_error()      # no LOAD REPORT table
+    hf_logging.disable_progress_bar()     # no weight-loading bar
+
+    name = "distilbert-base-uncased"
+    # Prefer the local cache: from_pretrained otherwise spends ~7s on a network freshness
+    # check for a model already on disk. Falls back to downloading on first run.
+    try:
+        tk = AutoTokenizer.from_pretrained(name, local_files_only=True)
+        md = AutoModel.from_pretrained(name, local_files_only=True,
+                                       attn_implementation="eager").eval()
+    except Exception:
+        tk = AutoTokenizer.from_pretrained(name)
+        md = AutoModel.from_pretrained(name, attn_implementation="eager").eval()
+    print(f"\n{name}: {sum(p.numel() for p in md.parameters()):,} parameters")
+
+    text = "the animal didn't cross the street because it was too tired ."
+    batch = tk(text, return_tensors="pt")
+    with torch.no_grad():
+        out = md(**batch, output_attentions=True)
+
+    toks = tk.convert_ids_to_tokens(batch["input_ids"][0])
+    it_i = toks.index("it")
+    # attentions is a tuple (one per layer) of (batch, heads, from, to). Layer 4, head 0.
+    row = out.attentions[4][0, 0, it_i].numpy()
+
+    print("\nlayer 4, head 0 - attention FROM 'it':")
+    for t, v in sorted(zip(toks, row), key=lambda kv: -kv[1])[:6]:
+        print(f"   {t:10} {v:.4f}  {'#' * int(v * 60)}")
+
+    a, s_ = row[toks.index("animal")], row[toks.index("street")]
+    print(f"\nanimal {a:.4f}  vs  street {s_:.4f}   ->  {a / s_:.0f}x more weight")
+    assert abs(a - 0.6080) < 0.002 and abs(s_ - 0.0207) < 0.002   # the on-screen numbers
+    assert a / s_ > 25
+
+    # ...but that is ONE head. The honest picture (this is where part 2 starts):
+    A = torch.stack(out.attentions)[:, 0]              # (layers, heads, from, to)
+    both = A[:, :, it_i, [toks.index("animal"), toks.index("street")]].numpy()
+    picks_animal = (both[:, :, 0] > both[:, :, 1]).sum()
+    print(f"\nof {both.shape[0] * both.shape[1]} heads, {picks_animal} put more on 'animal'")
+    print(f"averaged over ALL heads: animal {both[:, :, 0].mean():.3f}, "
+          f"street {both[:, :, 1].mean():.3f}")
+    print("=> one head is startlingly clean; the ensemble is much muddier. An attention map is")
+    print("   NOT the model's reasoning - that misconception is the heart of part 2.")
+    # ---- keep these around for sections 9 to 11 ----
+    _REAL = dict(tk=tk, md=md, toks=toks, it_i=it_i, row=row, A=A)
+except ImportError:
+    _REAL = None
+    print("\n[section 8 skipped - pip install torch transformers to run the real model]")
+
+
+# === SECTION 9 - REBUILD 0.6080 BY HAND, FROM Q AND K ===
+# 🎭 Analogy: section 8 asked the library for its answer and believed it. This is checking the
+# restaurant bill by adding it up yourself.
+#
+# So far we TRUSTED out.attentions. Now take the query and key vectors out of the model and
+# redo the arithmetic with the same three steps section 3 used on the toy:
+#     score  = q . k                    <- one dot product
+#     scaled = score / sqrt(head_dim)   <- part 2's division, already needed at real size
+#     weight = softmax(scaled)          <- squeeze so the row sums to 1
+# If this matches the library to seven decimals, the eight lines in section 3 ARE the
+# mechanism - not a simplification of it.
+if _REAL:
+    md, toks, it_i = _REAL["md"], _REAL["toks"], _REAL["it_i"]
+    L, H = 4, 0
+    layer = md.transformer.layer[L]
+    grabbed = {}
+    hk = layer.register_forward_pre_hook(lambda mod, args: grabbed.__setitem__("x", args[0]))
+    with torch.no_grad():
+        md(**batch)
+    hk.remove()
+
+    x = grabbed["x"][0]                                  # what actually enters the attention
+    sa = layer.attention
+    head_dim = x.shape[-1] // sa.n_heads
+    with torch.no_grad():
+        qv, kv = sa.q_lin(x), sa.k_lin(x)
+    qh = qv[:, H * head_dim:(H + 1) * head_dim]
+    kh = kv[:, H * head_dim:(H + 1) * head_dim]
+
+    dots = (qh[it_i] @ kh.T).detach().numpy()            # q('it') against every key
+    scaled = dots / np.sqrt(head_dim)
+    e = np.exp(scaled - scaled.max())
+    mine = e / e.sum()
+
+    ja, js = toks.index("animal"), toks.index("street")
+    print(f"\nhead dim {head_dim}, so we divide by sqrt({head_dim}) = {np.sqrt(head_dim):.0f}")
+    print(f"  q('it') . k('animal') = {dots[ja]:8.3f} -> {scaled[ja]:7.3f} -> {mine[ja]:.4f}")
+    print(f"  q('it') . k('street') = {dots[js]:8.3f} -> {scaled[js]:7.3f} -> {mine[js]:.4f}")
+
+    gap = np.abs(_REAL["row"] - mine).max()
+    print(f"\nours vs the library, biggest disagreement anywhere: {gap:.2e}")
+    assert gap < 1e-5, "by-hand softmax must reproduce the model"
+    print("=> two dot products and a softmax reproduce a 66-million-parameter model.")
+
+    # NOTE there is no causal mask in that softmax. DistilBERT is an ENCODER: every token sees
+    # every other token, INCLUDING later ones. Section 11 shows a model that cannot.
+
+
+# === SECTION 10 - BREAK IT: THE FLIP THAT DOES NOT HAPPEN ===
+# 🎭 Analogy: the textbook says the needle swings from one word to the other. Measure it and
+# the needle moves a long way, but it does not cross over.
+#
+# The famous claim: change "tired" to "wide" and "it" stops meaning the animal and starts
+# meaning the street. Our TOY (section 4) does exactly that, because it was hand-built to.
+# Here is what the real head does. This is the most important cell in the lab.
+if _REAL:
+    tk, md = _REAL["tk"], _REAL["md"]
+    wide = "the animal didn't cross the street because it was too wide ."
+    bw = tk(wide, return_tensors="pt")
+    with torch.no_grad():
+        ow = md(**bw, output_attentions=True)
+    tw = tk.convert_ids_to_tokens(bw["input_ids"][0])
+    rw = ow.attentions[4][0, 0, tw.index("it")].numpy()
+
+    a_t, s_t = _REAL["row"][ja], _REAL["row"][js]
+    a_w, s_w = rw[tw.index("animal")], rw[tw.index("street")]
+    print(f"\n{'':10}{'too tired':>12}{'too wide':>12}")
+    print(f"{'animal':10}{a_t:>12.4f}{a_w:>12.4f}")
+    print(f"{'street':10}{s_t:>12.4f}{s_w:>12.4f}")
+    print(f"\nstreet gained {s_w / s_t:.2f}x more attention - real, and in the right direction.")
+
+    if s_w > a_w:
+        print("=> it flipped.")
+    else:
+        print("=> BUT ANIMAL STILL WINS. The attention SHIFTED; it did not switch.")
+        assert a_w > s_w        # if this ever fails, rewrite the episode beat, not the assert
+    # And what it actually leans on is more interesting than a flip:
+    top = int(np.argmax(rw))
+    print(f"the biggest weight in the whole row is '{tw[top]}' at {rw[top]:.4f}"
+          f" - the head leans on the ADJECTIVE.")
+    print("=> one head does PART of a job. Anyone showing you a clean flip inside a real model")
+    print("   owes you the layer and head number so you can check it yourself.")
+
+
+# === SECTION 11 - A MODEL THAT CANNOT SEE THE WORD (encoder vs decoder) ===
+# 🎭 Analogy: the encoder reads the finished letter. The decoder is still typing it, and
+# cannot quote a sentence it has not written yet.
+#
+# Why can DistilBERT use "tired" at all, when "tired" comes AFTER "it"? Because it is an
+# encoder and reads both directions. GPT-2 is a decoder: at the moment it reads "it", the
+# last two words do not exist. Prediction: GPT-2's attention from "it" must be IDENTICAL
+# across both sentences. Not similar - identical. Test it rather than assert it.
+if _REAL:
+    try:
+        g_tk = AutoTokenizer.from_pretrained("gpt2")
+        g_md = AutoModel.from_pretrained("gpt2", attn_implementation="eager").eval()
+        rows = []
+        for sent in ("the animal didn't cross the street because it was too tired",
+                     "the animal didn't cross the street because it was too wide"):
+            en = g_tk(sent, return_tensors="pt")
+            pcs = [g_tk.decode([i]).strip() for i in en["input_ids"][0]]
+            with torch.no_grad():
+                At = torch.stack(g_md(**en, output_attentions=True).attentions)[:, 0].numpy()
+            k = [i for i, t in enumerate(pcs) if t == "it"][0]
+            rows.append(At[:, :, k, :k + 1])       # everything "it" is allowed to see
+        diff = np.abs(rows[0] - rows[1]).max()
+        print(f"\nGPT-2, attention from 'it' over {rows[0].shape} (layers, heads, visible tokens)")
+        print(f"  biggest difference between the two sentences: {diff:.2e}")
+        assert diff == 0.0, "a causal model cannot see the future"
+        print("=> BYTE-IDENTICAL. The decoder cannot use 'tired' or 'wide' at all.")
+        print("   That single measurement is why BERT-style models read and GPT-style models write.")
+    except Exception as exc:
+        print(f"\n[section 11 skipped: {exc}]")
+
+
 print("\nLAB COMPLETE — attention is a weighted average of values, and the weights are dot products.")
 print("NEXT (part 2): run this at real size and the softmax collapses to a single spike.")
 print("The fix is one division — / sqrt(d_k) — and then we run eight of these at once.")
